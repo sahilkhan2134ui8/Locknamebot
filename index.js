@@ -1,7 +1,7 @@
 const fs = require('fs');
 const express = require('express');
 const bodyParser = require('body-parser');
-const fca = require('ws3-fca');
+const login = require('fca-unofficial');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -10,13 +10,15 @@ let botConfig = {};
 let lockedGroups = {};
 let lockedNicknames = {};
 
+// 🔐 Restore previous locks
 try {
     lockedGroups = JSON.parse(fs.readFileSync('groupLocks.json', 'utf8'));
     lockedNicknames = JSON.parse(fs.readFileSync('nicknameLocks.json', 'utf8'));
 } catch {
-    console.log('ℹ️ No saved locks found.');
+    console.log('ℹ️ No saved locks found. Continuing without restoring locks.');
 }
 
+// 🌐 Web UI
 app.get('/', (req, res) => {
     res.send(`
         <html><head><title>Messenger Bot Config</title></head>
@@ -25,10 +27,11 @@ app.get('/', (req, res) => {
             <form method="POST" action="/configure">
                 <input name="adminID" placeholder="Admin Facebook ID" required><br><br>
                 <input name="prefix" value="!" placeholder="Command Prefix" required><br><br>
-                <textarea name="appstate" rows="10" cols="60" placeholder="Paste appstate JSON..." required></textarea><br><br>
+                <textarea name="appstate" rows="10" cols="60" placeholder="Paste appstate JSON array..." required></textarea><br><br>
                 <button type="submit">🚀 Start Bot</button>
             </form>
-        </body></html>
+        </body>
+        </html>
     `);
 });
 
@@ -41,12 +44,12 @@ app.post('/configure', (req, res) => {
         if (!Array.isArray(parsed)) throw new Error('AppState is not an array');
 
         fs.writeFileSync('appstate.json', JSON.stringify(parsed, null, 2));
-        console.log('📄 appstate.json saved.');
-        res.send('<h2>✅ Bot is starting... Check logs.</h2>');
+        console.log('📄 [INFO] appstate.json saved.');
+        res.send('<h2>✅ Bot is starting... Check terminal logs.</h2>');
         startBot();
     } catch (err) {
-        console.error('❌ Invalid AppState:', err.message);
-        res.send('<h2>❌ Invalid AppState format.</h2>');
+        console.error('❌ Invalid AppState JSON:', err.message);
+        res.send('<h2>❌ Invalid AppState format. Please check your input.</h2>');
     }
 });
 
@@ -59,21 +62,32 @@ function startBot() {
     let appState;
     try {
         appState = JSON.parse(fs.readFileSync('appstate.json', 'utf8'));
+        console.log('📄 [INFO] appstate.json loaded successfully.');
     } catch (err) {
         console.error('❌ Failed to load appstate.json:', err);
         return;
     }
 
-    fca.login(appState, (err, api) => {
-        if (err) return console.error('❌ Login failed:', err);
+    login({ appState }, (err, api) => {
+        if (err) {
+            console.error('❌ Login failed:', err);
+            return;
+        }
 
         api.setOptions({ listenEvents: true });
+
+        api.getUserInfo(api.getCurrentUserID(), (err, info) => {
+            if (!err && info) {
+                const name = info[api.getCurrentUserID()].name;
+                console.log(`🤖 Logged in as: ${name}`);
+            }
+        });
 
         api.listenMqtt((err, event) => {
             if (err) return console.error('❌ Listen error:', err);
 
             if (event.type === 'message' && event.body) {
-                console.log(`📩 [${event.threadID}] ${event.senderID}: ${event.body}`);
+                console.log(`📨 [${event.threadID}] ${event.senderID}: ${event.body}`);
             }
 
             if (event.type === 'message' && event.body?.startsWith(botConfig.prefix)) {
@@ -90,7 +104,8 @@ function startBot() {
                     lockedGroups[event.threadID] = groupName;
                     saveLocks();
                     api.setTitle(groupName, event.threadID, (err) => {
-                        api.sendMessage(err ? '❌ Failed.' : `✅ Locked as: ${groupName}`, event.threadID);
+                        if (err) return api.sendMessage('❌ Failed to lock group name.', event.threadID);
+                        api.sendMessage(`✅ Group name locked as: ${groupName}`, event.threadID);
                     });
                 }
 
@@ -99,13 +114,13 @@ function startBot() {
                     lockedNicknames[event.threadID] = nickname;
                     saveLocks();
                     api.getThreadInfo(event.threadID, (err, info) => {
-                        if (err) return api.sendMessage('❌ Thread info failed.', event.threadID);
+                        if (err) return api.sendMessage('❌ Failed to get thread info.', event.threadID);
                         info.participantIDs.forEach((uid, i) => {
                             setTimeout(() => {
                                 api.changeNickname(nickname, event.threadID, uid);
-                            }, i * 10000); // 10s delay
+                            }, i * 10000);
                         });
-                        api.sendMessage(`✅ Nicknames locked: ${nickname}`, event.threadID);
+                        api.sendMessage(`✅ Nicknames locked as: ${nickname}`, event.threadID);
                     });
                 }
 
@@ -115,17 +130,26 @@ function startBot() {
             }
 
             if (event.logMessageType === 'log:thread-name') {
-                const name = lockedGroups[event.threadID];
-                if (name) api.setTitle(name, event.threadID);
+                const lockedName = lockedGroups[event.threadID];
+                if (lockedName) {
+                    api.setTitle(lockedName, event.threadID);
+                }
             }
 
             if (event.logMessageType === 'log:thread-nickname') {
-                const nickname = lockedNicknames[event.threadID];
-                const userID = event.logMessageData?.participant_id;
-                if (nickname && userID) {
-                    console.log(`🔁 Nickname reverted for ${userID}`);
+                const lockedNick = lockedNicknames[event.threadID];
+                if (lockedNick) {
+                    const userID = event.logMessageData.participant_id;
+                    console.log(`🔁 Nickname changed by user ${userID}. Reverting in 2s...`);
+
                     setTimeout(() => {
-                        api.changeNickname(nickname, event.threadID, userID);
+                        api.changeNickname(lockedNick, event.threadID, userID, (err) => {
+                            if (err) {
+                                console.error(`❌ Failed to revert nickname for ${userID}: ${err.message}`);
+                            } else {
+                                console.log(`✅ Nickname reverted for ${userID}`);
+                            }
+                        });
                     }, 2000);
                 }
             }
@@ -133,8 +157,8 @@ function startBot() {
     });
 }
 
-// 🌐 Required to keep app alive on Render
+// 🌍 Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🌍 Bot dashboard at http://localhost:${PORT}`);
+    console.log(`🌐 Server running at http://localhost:${PORT}`);
 });
